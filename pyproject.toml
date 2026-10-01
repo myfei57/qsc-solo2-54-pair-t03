@@ -19,6 +19,7 @@ packages = [
     "hydrorefuel.truck",
     "hydrorefuel.vent",
     "hydrorefuel.comp",
+    "hydrorefuel.supply",
     "hydrorefuel.buffer",
     "hydrorefuel.cool",
     "hydrorefuel.flow",

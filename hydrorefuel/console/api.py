@@ -44,6 +44,11 @@ class Api:
         add("GET", "/api/truck", lambda params, body: {"truck": self._platform.truck_snapshot()})
         add("GET", "/api/vent", lambda params, body: {"vent": self._platform.vent_snapshot()})
         add("GET", "/api/compressor", lambda params, body: {"compressor": self._platform.compressor_snapshot()})
+        add("GET", "/api/supply", lambda params, body: {"supply": self._platform.supply_snapshot()})
+        add("GET", "/api/supply/reconcile", lambda params, body: self._platform.supply_reconcile())
+        add("POST", "/api/supply/measure", self._supply_measure)
+        add("POST", "/api/supply/charge", self._supply_charge)
+        add("POST", "/api/supply/fault", self._supply_fault)
         add("GET", "/api/buffer", lambda params, body: {"buffer": self._platform.buffer_snapshot()})
         add("GET", "/api/cool", lambda params, body: {"cool": self._platform.cool_snapshot()})
         add("GET", "/api/flow", lambda params, body: {"flow": self._platform.flow_snapshot()})
@@ -156,6 +161,32 @@ class Api:
             charge_kg=_as_float(body, "charge_kg", 8.0),
             dt=_as_float(body, "dt", 1.0),
         )
+
+    def _supply_measure(self, params: dict, body: dict) -> dict:
+        truck = body.get("truck_mpa")
+        cascade = body.get("cascade_mpa")
+        return self._platform.measure_supply(
+            truck_mpa=None if truck is None else _as_float(body, "truck_mpa", 0.0),
+            cascade_mpa=None if cascade is None else _as_float(body, "cascade_mpa", 0.0),
+        )
+
+    def _supply_charge(self, params: dict, body: dict) -> dict:
+        truck = body.get("truck_mpa")
+        cascade = body.get("cascade_mpa")
+        return self._platform.supply_charge(
+            demand_kg=_as_float(body, "demand_kg", 10.0),
+            flow_kg_per_min=_as_float(body, "flow_kg_per_min", 4.0),
+            dt=_as_float(body, "dt", 1.0),
+            truck_mpa=None if truck is None else _as_float(body, "truck_mpa", 0.0),
+            cascade_mpa=None if cascade is None else _as_float(body, "cascade_mpa", 0.0),
+        )
+
+    def _supply_fault(self, params: dict, body: dict) -> dict:
+        key = str(body.get("source", ""))
+        if key not in ("truck", "cascade"):
+            raise HydroError("source 必须是 truck 或 cascade", component="console")
+        faulted = bool(body.get("faulted", True))
+        return self._platform.set_supply_fault(key, faulted)
 
     def _fill(self, params: dict, body: dict) -> dict:
         return self._platform.fill(

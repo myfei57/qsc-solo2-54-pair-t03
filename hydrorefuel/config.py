@@ -17,6 +17,20 @@ from .errors import ConfigError
 
 _MISSING = object()
 
+#: 配额分配策略：按实际入口压力优先（出厂定死的策略）。
+PRESSURE_FIRST = "pressure"
+#: 配额分配策略：按剩余配额优先（仅装配期可显式选用，运行期不可改）。
+REMAINING_FIRST = "remaining"
+QUOTA_POLICIES = (PRESSURE_FIRST, REMAINING_FIRST)
+
+#: 到下限立即切；先降流量缓冲再切。具体用哪一种由离开侧气源自己定。
+IMMEDIATE_SWITCH = "immediate"
+RAMP_SWITCH = "ramp"
+SWITCH_MODES = (IMMEDIATE_SWITCH, RAMP_SWITCH)
+
+#: 两路气源的固定位序：压力或余量相同时按此位序打破平局。
+SUPPLY_KEYS = ("truck", "cascade")
+
 
 def _section(mapping: Mapping[str, Any], key: str) -> Mapping[str, Any]:
     value = mapping.get(key)
@@ -127,6 +141,93 @@ class CompressorLimits:
         if limits.outlet_target_mpa <= limits.inlet_min_mpa:
             raise ConfigError("压缩机目标压力必须高于入口最低压力", component="config")
         return limits
+
+
+@dataclass(frozen=True)
+class GasSourceLimits:
+    """单路气源的下限、配额与切换方式约束。"""
+
+    key: str
+    label: str
+    low_mpa: float
+    quota_kg: float
+    initial_pressure_mpa: float
+    pressure_coeff_mpa_per_kg: float
+    switch_mode: str
+
+    @classmethod
+    def from_mapping(cls, key: str, label: str, section: Mapping[str, Any]) -> "GasSourceLimits":
+        mode = section.get("switch_mode", RAMP_SWITCH)
+        if mode not in SWITCH_MODES:
+            raise ConfigError(f"气源 {key!r} 的 switch_mode 只能是 immediate 或 ramp", component="config")
+        limits = cls(
+            key=key,
+            label=label,
+            low_mpa=_number(section, "low_mpa", minimum=0.0),
+            quota_kg=_number(section, "quota_kg", minimum=0.1),
+            initial_pressure_mpa=_number(section, "initial_pressure_mpa", minimum=0.0),
+            pressure_coeff_mpa_per_kg=_number(section, "pressure_coeff_mpa_per_kg", minimum=0.001),
+            switch_mode=mode,
+        )
+        if limits.initial_pressure_mpa < limits.low_mpa:
+            raise ConfigError(f"气源 {key!r} 的初始压力不得低于自身下限压力", component="config")
+        return limits
+
+
+@dataclass(frozen=True)
+class SupplyLimits:
+    """双路气源的配额策略与切换时序约束。
+
+    策略在装配期定死：``pressure`` 表示按实测压力从高到低分配，``remaining``
+    表示按剩余配额从多到少分配；出厂配置固定为压力优先。切换时序给全局缺省，
+    各气源只声明自己的切换方式（立即或先降流量缓冲）。
+    """
+
+    quota_policy: str
+    ramp_dt_s: float
+    overlap_s: float
+    settle_s: float
+    sources: dict[str, GasSourceLimits]
+
+    @classmethod
+    def from_mapping(cls, section: Mapping[str, Any]) -> "SupplyLimits":
+        policy = section.get("quota_policy", PRESSURE_FIRST)
+        if policy not in QUOTA_POLICIES:
+            raise ConfigError("气源配额策略只能是 pressure 或 remaining", component="config")
+        raw_sources = section.get("sources")
+        if not isinstance(raw_sources, Mapping):
+            raise ConfigError("supply.sources 必须是映射", component="config")
+        unknown = set(raw_sources) - set(SUPPLY_KEYS)
+        if unknown:
+            raise ConfigError(f"未知气源: {sorted(unknown)}", component="config")
+        sources = {
+            "truck": GasSourceLimits.from_mapping(
+                "truck", "槽车", _section(raw_sources, "truck")
+            ),
+            "cascade": GasSourceLimits.from_mapping(
+                "cascade", "瓶组", _section(raw_sources, "cascade")
+            ),
+        }
+        limits = cls(
+            quota_policy=policy,
+            ramp_dt_s=_number(section, "ramp_dt_s", minimum=0.01),
+            overlap_s=_number(section, "overlap_s", minimum=0.0),
+            settle_s=_number(section, "settle_s", minimum=0.01),
+            sources=sources,
+        )
+        return limits
+
+    def validate_compressor(self, compressor: "CompressorLimits") -> None:
+        """交叉校验：每路气源的下限都不得低于压缩机最低入口压力。"""
+
+        for key in SUPPLY_KEYS:
+            source = self.sources[key]
+            if source.low_mpa < compressor.inlet_min_mpa:
+                raise ConfigError(
+                    f"气源 {key!r} 下限压力 {source.low_mpa} 不得低于压缩机最低入口压力 "
+                    f"{compressor.inlet_min_mpa}",
+                    component="config",
+                )
 
 
 @dataclass(frozen=True)
@@ -283,6 +384,7 @@ class StationConfig:
     truck: TruckLimits
     vent: VentLimits
     compressor: CompressorLimits
+    supply: SupplyLimits
     buffer: BufferLimits
     cool: CoolLimits
     flow: FlowLimits
@@ -301,12 +403,16 @@ class StationConfig:
             raise ConfigError("station.storage_root 必须是非空字符串", component="config")
 
         limits = _section(mapping, "limits")
+        compressor = CompressorLimits.from_mapping(_section(limits, "comp"))
+        supply = SupplyLimits.from_mapping(_section(limits, "supply"))
+        supply.validate_compressor(compressor)
         return cls(
             name=name,
             storage_root=storage_root,
             truck=TruckLimits.from_mapping(_section(limits, "truck")),
             vent=VentLimits.from_mapping(_section(limits, "vent")),
-            compressor=CompressorLimits.from_mapping(_section(limits, "comp")),
+            compressor=compressor,
+            supply=supply,
             buffer=BufferLimits.from_mapping(_section(limits, "buffer")),
             cool=CoolLimits.from_mapping(_section(limits, "cool")),
             flow=FlowLimits.from_mapping(_section(limits, "flow")),
@@ -337,6 +443,32 @@ def default_config() -> StationConfig:
         truck=TruckLimits(25.0, 1.5, 90.0, 6.0),
         vent=VentLimits(6.0, 0.9, 0.1, 40.0),
         compressor=CompressorLimits(3.0, 43.0, 0.8, 1.2, 1.5),
+        supply=SupplyLimits(
+            quota_policy=PRESSURE_FIRST,
+            ramp_dt_s=0.5,
+            overlap_s=0.5,
+            settle_s=0.5,
+            sources={
+                "truck": GasSourceLimits(
+                    key="truck",
+                    label="槽车",
+                    low_mpa=6.0,
+                    quota_kg=60.0,
+                    initial_pressure_mpa=20.0,
+                    pressure_coeff_mpa_per_kg=0.09,
+                    switch_mode=RAMP_SWITCH,
+                ),
+                "cascade": GasSourceLimits(
+                    key="cascade",
+                    label="瓶组",
+                    low_mpa=5.0,
+                    quota_kg=35.0,
+                    initial_pressure_mpa=17.0,
+                    pressure_coeff_mpa_per_kg=0.09,
+                    switch_mode=IMMEDIATE_SWITCH,
+                ),
+            },
+        ),
         buffer=BufferLimits(42.0, 1.5, 3600.0, 350.0),
         cool=CoolLimits(-40.0, 3.0, 0.6, 20.0),
         flow=FlowLimits(1.8, 0.15, 3.6, 0.4),
@@ -370,6 +502,24 @@ def config_to_mapping(cfg: StationConfig) -> dict:
                 "ramp_mpa_per_s": cfg.compressor.ramp_mpa_per_s,
                 "surge_band_mpa": cfg.compressor.surge_band_mpa,
                 "min_flow_kg_per_min": cfg.compressor.min_flow_kg_per_min,
+            },
+            "supply": {
+                "quota_policy": cfg.supply.quota_policy,
+                "tie_break_order": list(SUPPLY_KEYS),
+                "ramp_dt_s": cfg.supply.ramp_dt_s,
+                "overlap_s": cfg.supply.overlap_s,
+                "settle_s": cfg.supply.settle_s,
+                "sources": {
+                    key: {
+                        "label": cfg.supply.sources[key].label,
+                        "low_mpa": cfg.supply.sources[key].low_mpa,
+                        "quota_kg": cfg.supply.sources[key].quota_kg,
+                        "initial_pressure_mpa": cfg.supply.sources[key].initial_pressure_mpa,
+                        "pressure_coeff_mpa_per_kg": cfg.supply.sources[key].pressure_coeff_mpa_per_kg,
+                        "switch_mode": cfg.supply.sources[key].switch_mode,
+                    }
+                    for key in SUPPLY_KEYS
+                },
             },
             "buffer": {
                 "target_pressure_mpa": cfg.buffer.target_pressure_mpa,

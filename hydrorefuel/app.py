@@ -19,7 +19,7 @@ from .buffer.snapshot import BufferSnapshot
 from .clock import Clock, SystemClock
 from .comp.machine import Compressor
 from .comp.surge import SurgeGuard
-from .config import StationConfig, default_config
+from .config import StationConfig, SUPPLY_KEYS, default_config
 from .cool.precool import Precooler
 from .cool.snapshot import CoolSnapshot
 from .cool.temperature import TemperatureModel
@@ -40,9 +40,16 @@ from .ns.topology import Topology, build_default_topology
 from .queue.confirm import Confirmation
 from .queue.queue import FillQueue
 from .queue.snapshot import QueueSnapshot
-from .sequence import fill_vehicle, pressurize_buffer, stop_fill, unload_truck
+from .sequence import (
+    charge_from_supply,
+    fill_vehicle,
+    pressurize_buffer,
+    stop_fill,
+    unload_truck,
+)
 from .store.journal import JsonlJournal
 from .store.jsonfile import JsonStore
+from .supply.manifold import SupplyManifold
 from .telemetry import TrendBuffer
 from .truck.machine import TruckMachine
 from .vent.latch import VentLatch
@@ -80,6 +87,7 @@ class Platform:
         self.vent_latch = VentLatch(self.config.vent.latch_travel_mm)
         self.compressor = Compressor(self.config.compressor)
         self.surge = SurgeGuard(self.config.compressor)
+        self.manifold = SupplyManifold(self.config.supply, self.config.compressor.min_flow_kg_per_min)
         self.bank = BufferBank(self.config.buffer)
         self.baseline = BufferBaseline(
             self.config.buffer.target_pressure_mpa,
@@ -108,6 +116,7 @@ class Platform:
         self._operations = 0
         self._running = False
         self._last_audit_ts = 0.0
+        self._supply_epoch = 0
         self._lock = threading.RLock()
         self._register_namespaces()
         self._restore()
@@ -119,6 +128,8 @@ class Platform:
             ("station", "truck", "tube-trailer"),
             ("station", "vent", "vent-valve"),
             ("station", "compressor", "booster-compressor"),
+            ("station", "supply-truck", "supply-source"),
+            ("station", "supply-cascade", "supply-source"),
             ("station", "buffer", "storage-bank"),
             ("station", "precooler", "precool-unit"),
             ("station", "dispenser", "fill-dispenser"),
@@ -139,6 +150,10 @@ class Platform:
         if isinstance(state, dict):
             self._operations = int(state.get("operations", 0))
             self._cycles = int(state.get("cycles", 0))
+        supply_state = self.store.read("supply_state")
+        if isinstance(supply_state, dict):
+            self.manifold.restore(supply_state.get("ledger", {}))
+            self._supply_epoch = int(supply_state.get("epoch", 0))
 
     def _persist(self) -> None:
         """落盘平台计数，供重启后对照。"""
@@ -147,16 +162,21 @@ class Platform:
             "platform_state",
             {"operations": self._operations, "cycles": self._cycles, "unit": self.unit},
         )
+        self.store.write(
+            "supply_state",
+            {"epoch": self._supply_epoch, "ledger": self.manifold.ledger()},
+        )
 
     def _record_operation(self, op_id: str, operation: str, report: dict) -> dict:
         """把编排步骤逐条写审计，并记一条汇总事件。"""
 
         station = str(report.get("station", ""))
+        reserved = ("station", "op_id", "severity", "message", "ts", "component", "action")
         for step in report.get("steps", []):
             detail = {
                 key: value
                 for key, value in step.get("detail", {}).items()
-                if not isinstance(value, (dict, list)) and key not in ("station", "op_id", "severity", "message")
+                if not isinstance(value, (dict, list)) and key not in reserved
             }
             self.bus.publish(
                 Event.of(
@@ -267,6 +287,142 @@ class Platform:
             self._operations += 1
             self._persist()
             return {**report, **summary}
+
+    def measure_supply(self, truck_mpa: float | None = None, cascade_mpa: float | None = None) -> dict:
+        """上报两路气源的入口实测压力（变送器），缺省采用配置初始压力。"""
+
+        with self._lock:
+            defaults = {
+                key: self.config.supply.sources[key].initial_pressure_mpa for key in SUPPLY_KEYS
+            }
+            readings = {"truck": truck_mpa, "cascade": cascade_mpa}
+            measured = {}
+            for key in SUPPLY_KEYS:
+                value = defaults[key] if readings[key] is None else float(readings[key])
+                self.manifold.measure(key, value)
+                measured[key] = round(value, 3)
+                self.bus.publish(
+                    Event.of(
+                        "supply",
+                        "supply",
+                        "supply_measure",
+                        severity="notice",
+                        station=self.unit,
+                        source=key,
+                        pressure_mpa=round(value, 3),
+                        epoch=self._supply_epoch,
+                    )
+                )
+            self._persist()
+            return {"measured": measured, "epoch": self._supply_epoch, "supply": self.supply_snapshot()}
+
+    def supply_charge(
+        self,
+        demand_kg: float = 10.0,
+        flow_kg_per_min: float = 4.0,
+        dt: float = 1.0,
+        truck_mpa: float | None = None,
+        cascade_mpa: float | None = None,
+    ) -> dict:
+        """双路气源增压充瓶：测量 → 配额计划 → 逐路抽气与切换 → 缓存停机。"""
+
+        with self._lock:
+            # 未显式测量时按当前台账压力续抽；台账也是冷的才采用配置初始压力。
+            for key, override in (("truck", truck_mpa), ("cascade", cascade_mpa)):
+                if override is not None:
+                    self.manifold.measure(key, float(override))
+                elif not self.manifold.source(key).measured:
+                    self.manifold.measure(key, self.config.supply.sources[key].initial_pressure_mpa)
+
+            op_id = self.ids.next()
+            report = charge_from_supply(
+                self.manifold,
+                self.compressor,
+                self.bank,
+                self.baseline,
+                self.surge,
+                self.unit,
+                now=self.clock.now(),
+                demand_kg=demand_kg,
+                flow_kg_per_min=flow_kg_per_min,
+                dt=dt,
+                clock=self.clock,
+            )
+            plan = report.get("plan") or {}
+            self.bus.publish(
+                Event.of(
+                    "supply",
+                    "supply",
+                    "quota_allocated",
+                    severity="notice",
+                    station=self.unit,
+                    op_id=op_id,
+                    epoch=self._supply_epoch,
+                    policy=plan.get("policy"),
+                    first=plan.get("first"),
+                    demand_kg=report.get("demand_kg"),
+                    allocated_kg=plan.get("allocated_kg"),
+                )
+            )
+            for record in report.get("switches", []):
+                switch_payload = {
+                    k: v
+                    for k, v in record.items()
+                    if not isinstance(v, (dict, list)) and k not in ("ts",)
+                }
+                self.bus.publish(
+                    Event.of(
+                        "supply",
+                        "supply",
+                        "supply_switch",
+                        severity="warning" if record.get("rolled_back") else "notice",
+                        station=self.unit,
+                        op_id=op_id,
+                        epoch=self._supply_epoch,
+                        switch_ts=record.get("ts"),
+                        **switch_payload,
+                    )
+                )
+            used = {key: round(self.manifold.used_kg(key), 3) for key in SUPPLY_KEYS}
+            self.bus.publish(
+                Event.of(
+                    "supply",
+                    "supply",
+                    "supply_settled",
+                    severity="notice" if report.get("ok") else "warning",
+                    station=self.unit,
+                    op_id=op_id,
+                    epoch=self._supply_epoch,
+                    delivered_kg=report.get("delivered_kg"),
+                    shortfall_kg=report.get("shortfall_kg"),
+                    stop_reason=report.get("stop_reason"),
+                    truck_used_kg=used["truck"],
+                    cascade_used_kg=used["cascade"],
+                )
+            )
+            summary = self._record_operation(op_id, "supply_charge", report)
+            self._operations += 1
+            self._persist()
+            return {**report, **summary}
+
+    def set_supply_fault(self, key: str, faulted: bool) -> dict:
+        """注入或清除一路气源阀门故障，用于切换失败回退演练。"""
+
+        with self._lock:
+            self.manifold.set_fault(key, faulted)
+            self.bus.publish(
+                Event.of(
+                    "supply",
+                    "supply",
+                    "supply_fault",
+                    severity="alarm" if faulted else "notice",
+                    station=self.unit,
+                    source=key,
+                    faulted=faulted,
+                    epoch=self._supply_epoch,
+                )
+            )
+            return {"source": key, "faulted": faulted, "supply": self.supply_snapshot()}
 
     def fill(
         self,
@@ -524,6 +680,8 @@ class Platform:
         with self._lock:
             self.truck.reset()
             self.compressor.reset()
+            self.manifold.reset()
+            self._supply_epoch += 1
             self.bank.reset()
             self.temperature.reset()
             self.precooler.reset()
@@ -532,9 +690,11 @@ class Platform:
             self.dispenser.reset()
             self.queue.reset()
             removed = self.store.remove("platform_state") if self.store.exists("platform_state") else False
+            # 新 epoch 写一份零台账，重启后恢复到复位后的状态，不与旧审计混算。
+            self._persist()
             self._operations = 0
             self._cycles = 0
-            return {"platform_state_removed": removed, "store_root": self.store.root}
+            return {"platform_state_removed": removed, "store_root": self.store.root, "supply_epoch": self._supply_epoch}
 
     def truck_snapshot(self) -> dict:
         """返回槽车状态快照。"""
@@ -561,6 +721,91 @@ class Platform:
             **self.compressor.snapshot().as_dict(),
             "surge_trips": self.surge.trips(),
         }
+
+    def supply_snapshot(self) -> dict:
+        """返回双路气源快照（控制台展示配额与切换状态用）。"""
+
+        return {
+            **self.manifold.snapshot().as_dict(),
+            "switches": [record.as_dict() for record in self.manifold.switches()],
+            "epoch": self._supply_epoch,
+        }
+
+    def supply_reconcile(self) -> dict:
+        """核对两路配额台账、切换记录与审计流水三方一致。
+
+        台账给出每路配额用量；切换记录条数与审计里 ``supply_switch`` 事件逐条
+        对照；结算事件里的分路用量之和对照台账。只核对当前 epoch（reset 之后的
+        记录与旧台账不混算）。
+        """
+
+        with self._lock:
+            ledger = self.manifold.snapshot().as_dict()
+            records = self.audit.records(limit=4096)
+            epoch = self._supply_epoch
+
+            def in_epoch(payload: dict) -> bool:
+                return payload.get("epoch") == epoch
+
+            switch_events = [
+                entry for entry in records
+                if entry.component == "supply" and entry.action == "supply_switch" and in_epoch(entry.payload)
+            ]
+            settled_events = [
+                entry for entry in records
+                if entry.component == "supply" and entry.action == "supply_settled" and in_epoch(entry.payload)
+            ]
+            switch_records = self.manifold.switches()
+
+            switch_consistent = len(switch_events) == len(switch_records)
+            switch_pairs: list[dict] = []
+            for record, event in zip(switch_records, switch_events):
+                pair_ok = (
+                    event.payload.get("source_from") == record.source_from
+                    and event.payload.get("source_to") == record.source_to
+                    and event.payload.get("result") == record.result
+                )
+                switch_consistent = switch_consistent and pair_ok
+                switch_pairs.append(
+                    {"seq": record.seq, "result": record.result, "audit_ts": round(event.ts, 3), "ok": pair_ok}
+                )
+
+            # 结算事件记的是当次操作后的累计用量，以最近一次结算对照当前台账。
+            audited_truck = (
+                float(settled_events[-1].payload.get("truck_used_kg", 0.0)) if settled_events else 0.0
+            )
+            audited_cascade = (
+                float(settled_events[-1].payload.get("cascade_used_kg", 0.0)) if settled_events else 0.0
+            )
+
+            ledger_truck = self.manifold.used_kg("truck")
+            ledger_cascade = self.manifold.used_kg("cascade")
+            # 审计值按 3 位小数落盘，核对容差按半档 0.0005 再留一档余量。
+            used_consistent = (
+                abs(audited_truck - ledger_truck) <= 5e-3 and abs(audited_cascade - ledger_cascade) <= 5e-3
+            )
+
+            allocated_events = [
+                entry for entry in records
+                if entry.component == "supply" and entry.action == "quota_allocated" and in_epoch(entry.payload)
+            ]
+            policy_consistent = all(entry.payload.get("policy") == self.manifold.policy for entry in allocated_events)
+
+            return {
+                "epoch": epoch,
+                "policy": self.manifold.policy,
+                "ledger": ledger["sources"],
+                "ledger_total": ledger["total"],
+                "switch_count": len(switch_records),
+                "audit_switch_count": len(switch_events),
+                "switch_pairs": switch_pairs,
+                "audit_last_used_kg": {"truck": round(audited_truck, 3), "cascade": round(audited_cascade, 3)},
+                "switches_consistent": switch_consistent,
+                "used_consistent": used_consistent,
+                "policy_consistent": policy_consistent,
+                "settled_ops": len(settled_events),
+                "consistent": switch_consistent and used_consistent and policy_consistent,
+            }
 
     def buffer_snapshot(self) -> dict:
         """返回瓶组状态快照。"""
@@ -655,6 +900,7 @@ class Platform:
             "truck": self.truck_snapshot(),
             "vent": self.vent_snapshot(),
             "compressor": self.compressor_snapshot(),
+            "supply": self.supply_snapshot(),
             "buffer": self.buffer_snapshot(),
             "cool": self.cool_snapshot(),
             "flow": self.flow_snapshot(),

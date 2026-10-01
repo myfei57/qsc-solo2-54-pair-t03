@@ -71,6 +71,15 @@ def _cmd_demo(args: argparse.Namespace) -> int:
     startup = platform.start()
     unload = platform.unload(hose_pressure_mpa=20.0, target_kg=args.target_kg)
     pressurize = platform.pressurize(inlet_pressure_mpa=12.0, flow_kg_per_min=4.0, charge_kg=12.0)
+    # 双路气源增压：槽车压力高先抽，抽到下限按槽车的 ramp 方式缓冲后切到瓶组。
+    supply = platform.supply_charge(demand_kg=40.0, flow_kg_per_min=4.0, truck_mpa=8.0, cascade_mpa=7.5)
+    # 切换失败回退演练：瓶组阀门置故障后，槽车到下限无法切出，回退原路并记违约。
+    platform.set_supply_fault("cascade", True)
+    supply_rollback = platform.supply_charge(
+        demand_kg=40.0, flow_kg_per_min=4.0, truck_mpa=8.0, cascade_mpa=7.5
+    )
+    platform.set_supply_fault("cascade", False)
+    supply_reconcile = platform.supply_reconcile()
     disturbance = platform.disturb_buffer(delta_mpa=-1.0)
     fill = platform.fill(vehicle="vehicle01", rate_kg_per_min=3.0, steps=args.steps)
     stop = platform.stop_fill()
@@ -92,6 +101,27 @@ def _cmd_demo(args: argparse.Namespace) -> int:
         "startup": startup,
         "unload": {"ok": unload["ok"], "steps": [step["action"] for step in unload["steps"]]},
         "pressurize": {"ok": pressurize["ok"], "steps": [step["action"] for step in pressurize["steps"]]},
+        "supply": {
+            "ok": supply["ok"],
+            "first": supply["first_source"],
+            "delivered_kg": supply["delivered_kg"],
+            "stop_reason": supply["stop_reason"],
+            "switches": [
+                {"from": item["source_from"], "to": item["source_to"], "mode": item["switch_mode"]}
+                for item in supply["switches"]
+            ],
+        },
+        "supply_rollback": {
+            "ok": supply_rollback["ok"],
+            "violations": supply_rollback["violations"],
+            "rolled_back": all(item["rolled_back"] for item in supply_rollback["switches"]),
+        },
+        "supply_reconcile": {
+            "consistent": supply_reconcile["consistent"],
+            "switches_consistent": supply_reconcile["switches_consistent"],
+            "used_consistent": supply_reconcile["used_consistent"],
+            "policy_consistent": supply_reconcile["policy_consistent"],
+        },
         "disturbance": disturbance,
         "fill": {"ok": fill["ok"], "steps": [step["action"] for step in fill["steps"]]},
         "stop": {"ok": stop["ok"], "steps": [step["action"] for step in stop["steps"]]},
@@ -107,9 +137,14 @@ def _cmd_demo(args: argparse.Namespace) -> int:
     }
     _dump(report)
     failures = [name for name, item in probe.items() if not item["ok"]]
-    for operation in (unload, pressurize, fill, stop):
+    for operation in (unload, pressurize, fill, stop, supply):
         if not operation["ok"]:
             failures.extend(operation["violations"])
+    # 回退演练预期"部分失败"：必须真的回退到原路且审计一致，否则才是缺陷。
+    if supply_rollback["ok"] or "supply_switch_failed" not in supply_rollback["violations"]:
+        failures.append("supply_rollback_not_observed")
+    if not supply_reconcile["consistent"]:
+        failures.append("supply_reconcile_inconsistent")
     if not stop["ok"]:
         failures.append("stop_fill_not_completed")
     if failures:

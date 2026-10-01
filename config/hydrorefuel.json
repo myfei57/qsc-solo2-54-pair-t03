@@ -23,6 +23,30 @@
       "surge_band_mpa": 1.2,
       "min_flow_kg_per_min": 1.5
     },
+    "supply": {
+      "quota_policy": "pressure",
+      "ramp_dt_s": 0.5,
+      "overlap_s": 0.5,
+      "settle_s": 0.5,
+      "sources": {
+        "truck": {
+          "label": "槽车",
+          "low_mpa": 6.0,
+          "quota_kg": 60.0,
+          "initial_pressure_mpa": 20.0,
+          "pressure_coeff_mpa_per_kg": 0.09,
+          "switch_mode": "ramp"
+        },
+        "cascade": {
+          "label": "瓶组",
+          "low_mpa": 5.0,
+          "quota_kg": 35.0,
+          "initial_pressure_mpa": 17.0,
+          "pressure_coeff_mpa_per_kg": 0.09,
+          "switch_mode": "immediate"
+        }
+      }
+    },
     "buffer": {
       "target_pressure_mpa": 42.0,
       "pressure_tolerance_mpa": 1.5,
