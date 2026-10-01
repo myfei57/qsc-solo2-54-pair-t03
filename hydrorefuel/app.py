@@ -32,6 +32,14 @@ from .flow.meter import MassFlowMeter
 from .flow.snapshot import FlowSnapshot
 from .flow.step import FlowStep
 from .ids import IdFactory
+from .intake import (
+    PLAN_ACTION,
+    RESET_ACTION,
+    SETTLE_ACTION,
+    SWITCH_ACTION,
+    IntakeSelector,
+    reconcile,
+)
 from .leak.detector import LeakDetector
 from .leak.latch import LeakLatch
 from .leak.snapshot import LeakSnapshot
@@ -103,6 +111,7 @@ class Platform:
         self.leak_latch = LeakLatch(self.config.leak.hold_s)
         self.queue = FillQueue(self.config.queue)
         self.confirm = Confirmation(self.config.queue.confirm_timeout_s)
+        self.intake = IntakeSelector(self.config.intake)
 
         self._cycles = 0
         self._operations = 0
@@ -126,11 +135,12 @@ class Platform:
             ("station", "flowmeter", "mass-flow-meter"),
             ("station", "leak", "leak-detector"),
             ("station", "queue", "fill-queue"),
+            ("station", "intake", "intake-selector"),
         ):
             self.namespaces.register(area, device, kind)
 
     def _restore(self) -> None:
-        """从落盘状态恢复平台计数，保证重启后计数连续。"""
+        """从落盘状态恢复平台计数与取气配额台账，保证重启后计数连续。"""
 
         tail = self.audit.replay_from_journal(limit=1)
         if tail:
@@ -139,6 +149,51 @@ class Platform:
         if isinstance(state, dict):
             self._operations = int(state.get("operations", 0))
             self._cycles = int(state.get("cycles", 0))
+        self._restore_intake()
+
+    def _restore_intake(self) -> None:
+        """按审计流水里最后一次取气复位与结算重建配额账本。
+
+        只恢复账本（纪元、两路剩余配额、累计实抽），气源压力每次增压操作都由
+        现场重新上报，不从历史记录里猜。
+        """
+
+        records = self.audit.replay_from_journal()
+        reset_ts = -1.0
+        last_settle: dict | None = None
+        for raw in records:
+            record = AuditRecord.from_dict(raw)
+            if record.station != self.unit or record.component != "intake":
+                continue
+            if record.action == RESET_ACTION:
+                reset_ts = record.ts
+                last_settle = None
+            elif record.action == SETTLE_ACTION and record.ts >= reset_ts:
+                last_settle = record.payload
+        if last_settle is not None:
+            drawn = {"truck": 0.0, "bank": 0.0}
+            for raw in records:
+                record = AuditRecord.from_dict(raw)
+                if (
+                    record.station != self.unit
+                    or record.component != "intake"
+                    or record.action != SETTLE_ACTION
+                    or record.ts < reset_ts
+                    or int(record.payload.get("epoch", 0)) != int(last_settle.get("epoch", 0))
+                ):
+                    continue
+                drawn["truck"] += float(record.payload.get("truck_drawn_kg", 0.0))
+                drawn["bank"] += float(record.payload.get("bank_drawn_kg", 0.0))
+            self.intake.restore(
+                epoch=int(last_settle.get("epoch", 0)),
+                quotas={
+                    "truck": float(last_settle.get("truck_remaining_kg", 0.0)),
+                    "bank": float(last_settle.get("bank_remaining_kg", 0.0)),
+                },
+                drawn=drawn,
+                switch_count=int(last_settle.get("switch_count", 0)),
+                failed_switches=int(last_settle.get("failed_switches", 0)),
+            )
 
     def _persist(self) -> None:
         """落盘平台计数，供重启后对照。"""
@@ -246,8 +301,9 @@ class Platform:
         flow_kg_per_min: float = 4.0,
         charge_kg: float = 8.0,
         dt: float = 1.0,
+        bank_pressure_mpa: float | None = None,
     ) -> dict:
-        """增压充瓶编排：目标瓶组核对 → 压缩机启动 → 升压 → 瓶组缓存。"""
+        """增压充瓶编排：基线核对 → 双路取气配额 → 压缩机升压 → 瓶组缓存。"""
 
         with self._lock:
             op_id = self.ids.next()
@@ -256,17 +312,91 @@ class Platform:
                 self.bank,
                 self.baseline,
                 self.surge,
+                self.intake,
                 self.unit,
                 now=self.clock.now(),
                 inlet_pressure_mpa=inlet_pressure_mpa,
+                bank_pressure_mpa=bank_pressure_mpa,
                 flow_kg_per_min=flow_kg_per_min,
                 charge_kg=charge_kg,
                 dt=dt,
             )
+            self._publish_intake_records(op_id, report)
             summary = self._record_operation(op_id, "pressurize", report)
             self._operations += 1
             self._persist()
             return {**report, **summary}
+
+    def _publish_intake_records(self, op_id: str, report: dict) -> None:
+        """把两路配额计划、每次切换、配额结算显式发成审计事件（标量字段，便于核对）。"""
+
+        plan = report.get("intake_plan") or {}
+        if plan:
+            self.bus.publish(
+                Event.of(
+                    "intake",
+                    "intake",
+                    PLAN_ACTION,
+                    station=self.unit,
+                    op_id=op_id,
+                    severity="notice",
+                    policy=plan.get("policy", "pressure_first"),
+                    first_source=plan.get("first_source", ""),
+                    order=">".join(plan.get("order", [])),
+                    truck_planned_kg=round(plan.get("planned_kg", {}).get("truck", 0.0), 3),
+                    bank_planned_kg=round(plan.get("planned_kg", {}).get("bank", 0.0), 3),
+                    total_planned_kg=round(plan.get("total_planned_kg", 0.0), 3),
+                    epoch=self.intake.epoch,
+                )
+            )
+        for record in report.get("switch_records", []):
+            severity = "warning" if record.get("rolled_back") else "notice"
+            self.bus.publish(
+                Event.of(
+                    "intake",
+                    "intake",
+                    SWITCH_ACTION,
+                    station=self.unit,
+                    op_id=op_id,
+                    severity=severity,
+                    seq=record.get("seq", 0),
+                    from_source=record.get("from", ""),
+                    to_source=record.get("to", ""),
+                    mode=record.get("mode", ""),
+                    reason=record.get("reason", ""),
+                    steps=record.get("steps", 0),
+                    elapsed_s=record.get("elapsed_s", 0.0),
+                    rolled_back=bool(record.get("rolled_back")),
+                    epoch=self.intake.epoch,
+                )
+            )
+        settle = report.get("intake_settlement") or {}
+        if settle:
+            self.bus.publish(
+                Event.of(
+                    "intake",
+                    "intake",
+                    SETTLE_ACTION,
+                    station=self.unit,
+                    op_id=op_id,
+                    severity="notice" if report.get("ok") else "warning",
+                    outcome=settle.get("outcome", ""),
+                    stop_reason=settle.get("stop_reason") or "",
+                    active_source=settle.get("active_source", ""),
+                    truck_drawn_kg=round(settle.get("drawn_kg", {}).get("truck", 0.0), 3),
+                    bank_drawn_kg=round(settle.get("drawn_kg", {}).get("bank", 0.0), 3),
+                    drawn_total_kg=round(settle.get("drawn_total_kg", 0.0), 3),
+                    truck_remaining_kg=round(settle.get("remaining_quota_kg", {}).get("truck", 0.0), 3),
+                    bank_remaining_kg=round(settle.get("remaining_quota_kg", {}).get("bank", 0.0), 3),
+                    truck_opening_kg=round(settle.get("opening_quota_kg", {}).get("truck", 0.0), 3),
+                    bank_opening_kg=round(settle.get("opening_quota_kg", {}).get("bank", 0.0), 3),
+                    switches_this_op=int(report.get("switches_this_op", 0)),
+                    failures_this_op=int(report.get("failed_switches_this_op", 0)),
+                    switch_count=int(settle.get("switch_count", 0)),
+                    failed_switches=int(settle.get("failed_switches", 0)),
+                    epoch=int(settle.get("epoch", self.intake.epoch)),
+                )
+            )
 
     def fill(
         self,
@@ -524,6 +654,7 @@ class Platform:
         with self._lock:
             self.truck.reset()
             self.compressor.reset()
+            self.intake.reset()
             self.bank.reset()
             self.temperature.reset()
             self.precooler.reset()
@@ -561,6 +692,76 @@ class Platform:
             **self.compressor.snapshot().as_dict(),
             "surge_trips": self.surge.trips(),
         }
+
+    def intake_snapshot(self) -> dict:
+        """返回两路取气配额、压力、活动路与切换台账快照（控制台展示口径）。"""
+
+        snapshot = self.intake.snapshot().as_dict()
+        snapshot["policy_locked"] = True
+        snapshot["switch_records"] = self.intake.switch_records()
+        snapshot["idle_flow_kg_per_min"] = self.config.intake.idle_flow_kg_per_min
+        snapshot["switch_steps"] = self.config.intake.switch_steps
+        return snapshot
+
+    def set_intake_quota(self, source: str, quota_kg: float) -> dict:
+        """调整某路取气配额并落审计，返回更新后的该路配额。"""
+
+        with self._lock:
+            result = self.intake.set_quota(source, quota_kg)
+            self.bus.publish(
+                Event.of(
+                    "intake",
+                    "intake",
+                    "intake_quota_set",
+                    station=self.unit,
+                    severity="notice",
+                    source=source,
+                    quota_kg=round(float(quota_kg), 3),
+                    drawn_kg=result["drawn_kg"],
+                    epoch=self.intake.epoch,
+                )
+            )
+            return result
+
+    def arm_intake_switch_failure(self) -> dict:
+        """安排下一次气源切换提交失败（部分失败回滚演练）。"""
+
+        with self._lock:
+            self.intake.arm_switch_failure()
+            self.bus.publish(
+                Event.of(
+                    "intake",
+                    "intake",
+                    "intake_switch_failure_armed",
+                    station=self.unit,
+                    severity="warning",
+                    epoch=self.intake.epoch,
+                )
+            )
+            return {"armed": True}
+
+    def reset_intake(self) -> dict:
+        """清空取气台账与配额，纪元加一；旧纪元审计保留但不再参与核对。"""
+
+        with self._lock:
+            epoch = self.intake.reset()
+            self.bus.publish(
+                Event.of(
+                    "intake",
+                    "intake",
+                    RESET_ACTION,
+                    station=self.unit,
+                    severity="notice",
+                    epoch=epoch,
+                )
+            )
+            return {"epoch": epoch}
+
+    def intake_reconcile(self) -> dict:
+        """核对取气台账与落盘审计流水的一致性。"""
+
+        with self._lock:
+            return reconcile(self.intake, self.audit.replay_from_journal(), station=self.unit)
 
     def buffer_snapshot(self) -> dict:
         """返回瓶组状态快照。"""
@@ -655,6 +856,7 @@ class Platform:
             "truck": self.truck_snapshot(),
             "vent": self.vent_snapshot(),
             "compressor": self.compressor_snapshot(),
+            "intake": self.intake_snapshot(),
             "buffer": self.buffer_snapshot(),
             "cool": self.cool_snapshot(),
             "flow": self.flow_snapshot(),

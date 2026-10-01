@@ -55,6 +55,25 @@
     "queue": {
       "max_waiting": 12,
       "confirm_timeout_s": 45.0
+    },
+    "intake": {
+      "allocation_policy": "pressure_first",
+      "switch_steps": 3,
+      "idle_flow_kg_per_min": 2.0,
+      "sources": {
+        "truck": {
+          "cutoff_mpa": 5.0,
+          "quota_kg": 180.0,
+          "depletion_mpa_per_kg": 0.1,
+          "switch_mode": "immediate"
+        },
+        "bank": {
+          "cutoff_mpa": 4.0,
+          "quota_kg": 120.0,
+          "depletion_mpa_per_kg": 0.05,
+          "switch_mode": "buffered"
+        }
+      }
     }
   }
 }

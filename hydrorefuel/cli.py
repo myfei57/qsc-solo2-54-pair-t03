@@ -71,6 +71,20 @@ def _cmd_demo(args: argparse.Namespace) -> int:
     startup = platform.start()
     unload = platform.unload(hose_pressure_mpa=20.0, target_kg=args.target_kg)
     pressurize = platform.pressurize(inlet_pressure_mpa=12.0, flow_kg_per_min=4.0, charge_kg=12.0)
+    # 单独演示一次配额切换：把槽车配额压到 6 kg，压力优先先抽槽车，配额用尽
+    # 后按瓶组缓冲时序切换；配额收口属正常结束，不算失败。
+    platform.set_intake_quota("truck", 6.0)
+    quota_switch = platform.pressurize(
+        inlet_pressure_mpa=12.0, bank_pressure_mpa=9.0, flow_kg_per_min=4.0, charge_kg=8.0
+    )
+    quota_switch_summary = {
+        "ok": quota_switch["ok"],
+        "plan": quota_switch.get("intake_plan"),
+        "settlement": quota_switch.get("intake_settlement"),
+        "switches": quota_switch.get("switch_records"),
+        "stop_reason": quota_switch.get("stop_reason"),
+    }
+    intake_reconcile = platform.intake_reconcile()
     disturbance = platform.disturb_buffer(delta_mpa=-1.0)
     fill = platform.fill(vehicle="vehicle01", rate_kg_per_min=3.0, steps=args.steps)
     stop = platform.stop_fill()
@@ -91,7 +105,16 @@ def _cmd_demo(args: argparse.Namespace) -> int:
     report = {
         "startup": startup,
         "unload": {"ok": unload["ok"], "steps": [step["action"] for step in unload["steps"]]},
-        "pressurize": {"ok": pressurize["ok"], "steps": [step["action"] for step in pressurize["steps"]]},
+        "pressurize": {
+            "ok": pressurize["ok"],
+            "steps": [step["action"] for step in pressurize["steps"]],
+            "intake_plan": pressurize.get("intake_plan"),
+            "intake_settlement": pressurize.get("intake_settlement"),
+            "switch_records": pressurize.get("switch_records"),
+            "stop_reason": pressurize.get("stop_reason"),
+        },
+        "quota_switch_demo": quota_switch_summary,
+        "intake_reconcile": intake_reconcile,
         "disturbance": disturbance,
         "fill": {"ok": fill["ok"], "steps": [step["action"] for step in fill["steps"]]},
         "stop": {"ok": stop["ok"], "steps": [step["action"] for step in stop["steps"]]},

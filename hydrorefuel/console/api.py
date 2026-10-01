@@ -44,6 +44,8 @@ class Api:
         add("GET", "/api/truck", lambda params, body: {"truck": self._platform.truck_snapshot()})
         add("GET", "/api/vent", lambda params, body: {"vent": self._platform.vent_snapshot()})
         add("GET", "/api/compressor", lambda params, body: {"compressor": self._platform.compressor_snapshot()})
+        add("GET", "/api/intake", lambda params, body: {"intake": self._platform.intake_snapshot()})
+        add("GET", "/api/intake/reconcile", lambda params, body: self._platform.intake_reconcile())
         add("GET", "/api/buffer", lambda params, body: {"buffer": self._platform.buffer_snapshot()})
         add("GET", "/api/cool", lambda params, body: {"cool": self._platform.cool_snapshot()})
         add("GET", "/api/flow", lambda params, body: {"flow": self._platform.flow_snapshot()})
@@ -60,6 +62,9 @@ class Api:
         add("POST", "/api/step", self._step)
         add("POST", "/api/unload", self._unload)
         add("POST", "/api/pressurize", self._pressurize)
+        add("POST", "/api/intake/quota", self._intake_quota)
+        add("POST", "/api/intake/arm-failure", lambda params, body: self._platform.arm_intake_switch_failure())
+        add("POST", "/api/intake/reset", lambda params, body: self._platform.reset_intake())
         add("POST", "/api/fill", self._fill)
         add("POST", "/api/stop", self._stop)
         add("POST", "/api/leak/sample", self._leak_sample)
@@ -150,12 +155,18 @@ class Api:
         )
 
     def _pressurize(self, params: dict, body: dict) -> dict:
+        bank_pressure = body.get("bank_pressure_mpa", None)
         return self._platform.pressurize(
             inlet_pressure_mpa=_as_float(body, "inlet_pressure_mpa", 12.0),
             flow_kg_per_min=_as_float(body, "flow_kg_per_min", 4.0),
             charge_kg=_as_float(body, "charge_kg", 8.0),
             dt=_as_float(body, "dt", 1.0),
+            bank_pressure_mpa=None if bank_pressure is None else float(bank_pressure),
         )
+
+    def _intake_quota(self, params: dict, body: dict) -> dict:
+        source = str(body.get("source", "truck"))
+        return self._platform.set_intake_quota(source, _as_float(body, "quota_kg", 0.0))
 
     def _fill(self, params: dict, body: dict) -> dict:
         return self._platform.fill(

@@ -18,8 +18,21 @@ def test_snapshot_contains_all_components(platform):
     snapshot = platform.snapshot()
     for key in ("status", "topology", "namespaces", "trend", "readiness"):
         assert key in snapshot
-    for key in ("truck", "vent", "compressor", "buffer", "cool", "flow", "disp", "leak", "queue"):
+    for key in (
+        "truck",
+        "vent",
+        "compressor",
+        "intake",
+        "buffer",
+        "cool",
+        "flow",
+        "disp",
+        "leak",
+        "queue",
+    ):
         assert key in snapshot["status"]
+    assert snapshot["status"]["intake"]["policy"] == "pressure_first"
+    assert set(snapshot["status"]["intake"]["sources"]) == {"truck", "bank"}
 
 
 def test_concurrency_probe_converges(platform):
@@ -33,7 +46,8 @@ def test_concurrency_probe_converges(platform):
 
 def test_namespace_resolution(platform):
     assert platform.namespace("station.vent")["kind"] == "vent-valve"
-    assert platform.namespaces_describe()["count"] == 10
+    assert platform.namespace("station.intake")["kind"] == "intake-selector"
+    assert platform.namespaces_describe()["count"] == 11
 
 
 def test_reset_state_clears_counts(platform):

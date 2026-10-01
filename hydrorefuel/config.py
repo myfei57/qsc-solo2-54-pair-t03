@@ -274,6 +274,79 @@ class QueueLimits:
         )
 
 
+# 取气配额策略只有一个合法取值：按压力优先。余量优先被明确排除，调用方不得
+# 在运行期改策略；策略名落在配置与快照里，控制台与审计共用同一口径。
+PRESSURE_FIRST = "pressure_first"
+INTAKE_SOURCES = ("truck", "bank")
+INTAKE_SWITCH_MODES = ("immediate", "buffered")
+
+
+@dataclass(frozen=True)
+class IntakeSourceLimits:
+    """单路气源（槽车／瓶组）的取气下限、配额与切换方式约束。"""
+
+    source_id: str
+    cutoff_mpa: float
+    quota_kg: float
+    depletion_mpa_per_kg: float
+    switch_mode: str
+
+    @classmethod
+    def from_mapping(cls, source_id: str, section: Mapping[str, Any]) -> "IntakeSourceLimits":
+        if source_id not in INTAKE_SOURCES:
+            raise ConfigError(f"未知气源 {source_id!r}", component="config")
+        mode = section.get("switch_mode", "buffered")
+        if mode not in INTAKE_SWITCH_MODES:
+            raise ConfigError(f"气源 {source_id} 的切换方式必须是 {INTAKE_SWITCH_MODES} 之一", component="config")
+        return cls(
+            source_id=source_id,
+            cutoff_mpa=_number(section, "cutoff_mpa", minimum=0.0),
+            quota_kg=_number(section, "quota_kg", minimum=0.0),
+            depletion_mpa_per_kg=_number(section, "depletion_mpa_per_kg", minimum=0.001),
+            switch_mode=str(mode),
+        )
+
+
+@dataclass(frozen=True)
+class IntakeLimits:
+    """两路取气选择：固定压力优先的配额分配与分相序切换约束。"""
+
+    allocation_policy: str
+    switch_steps: int
+    idle_flow_kg_per_min: float
+    sources: dict[str, IntakeSourceLimits]
+
+    @classmethod
+    def from_mapping(cls, section: Mapping[str, Any]) -> "IntakeLimits":
+        policy = section.get("allocation_policy", PRESSURE_FIRST)
+        if policy != PRESSURE_FIRST:
+            raise ConfigError("取气配额策略被定死为 pressure_first（压力优先）", component="config")
+        steps = _integer(section, "switch_steps", minimum=1)
+        idle = _number(section, "idle_flow_kg_per_min", minimum=0.0)
+        raw_sources = _section(section, "sources")
+        sources = {
+            source_id: IntakeSourceLimits.from_mapping(source_id, _section(raw_sources, source_id))
+            for source_id in INTAKE_SOURCES
+        }
+        return cls(
+            allocation_policy=PRESSURE_FIRST,
+            switch_steps=steps,
+            idle_flow_kg_per_min=idle,
+            sources=sources,
+        )
+
+    def source(self, source_id: str) -> IntakeSourceLimits:
+        """按编号取一路气源约束。"""
+
+        return self.sources[source_id]
+
+    def idle_fraction(self, nominal_flow_kg_per_min: float) -> float:
+        """缓冲切换时怠速流量占当前满流量的份额（上限 1.0，全流量不缓冲）。"""
+
+        flow = max(1e-9, float(nominal_flow_kg_per_min))
+        return min(1.0, self.idle_flow_kg_per_min / flow)
+
+
 @dataclass(frozen=True)
 class StationConfig:
     """一份完整的平台配置。"""
@@ -289,6 +362,7 @@ class StationConfig:
     dispenser: DispenserLimits
     leak: LeakLimits
     queue: QueueLimits
+    intake: IntakeLimits
 
     @classmethod
     def from_mapping(cls, mapping: Mapping[str, Any]) -> "StationConfig":
@@ -301,19 +375,35 @@ class StationConfig:
             raise ConfigError("station.storage_root 必须是非空字符串", component="config")
 
         limits = _section(mapping, "limits")
+        intake = IntakeLimits.from_mapping(_section(limits, "intake"))
+        comp = CompressorLimits.from_mapping(_section(limits, "comp"))
+        cls._check_intake_vs_compressor(intake, comp)
         return cls(
             name=name,
             storage_root=storage_root,
             truck=TruckLimits.from_mapping(_section(limits, "truck")),
             vent=VentLimits.from_mapping(_section(limits, "vent")),
-            compressor=CompressorLimits.from_mapping(_section(limits, "comp")),
+            compressor=comp,
             buffer=BufferLimits.from_mapping(_section(limits, "buffer")),
             cool=CoolLimits.from_mapping(_section(limits, "cool")),
             flow=FlowLimits.from_mapping(_section(limits, "flow")),
             dispenser=DispenserLimits.from_mapping(_section(limits, "disp")),
             leak=LeakLimits.from_mapping(_section(limits, "leak")),
             queue=QueueLimits.from_mapping(_section(limits, "queue")),
+            intake=intake,
         )
+
+    @staticmethod
+    def _check_intake_vs_compressor(intake: "IntakeLimits", comp: "CompressorLimits") -> None:
+        """切换怠速流量必须高于喘振下限，否则分相序缓冲切换会自己把压缩机打进喘振。"""
+
+        if intake.idle_flow_kg_per_min < comp.min_flow_kg_per_min:
+            raise ConfigError("取气切换怠速流量不得低于压缩机最小流量", component="config")
+        for source in intake.sources.values():
+            if source.cutoff_mpa < comp.inlet_min_mpa:
+                raise ConfigError(
+                    f"气源 {source.source_id} 的取气下限不得低于压缩机入口最低压力", component="config"
+                )
 
 
 def load_config(path: str) -> StationConfig:
@@ -343,6 +433,27 @@ def default_config() -> StationConfig:
         dispenser=DispenserLimits(55.0, 15.0, 44.0, 2.0),
         leak=LeakLimits(4000.0, 5.0, 30.0),
         queue=QueueLimits(12, 45.0),
+        intake=IntakeLimits(
+            allocation_policy=PRESSURE_FIRST,
+            switch_steps=3,
+            idle_flow_kg_per_min=2.0,
+            sources={
+                "truck": IntakeSourceLimits(
+                    source_id="truck",
+                    cutoff_mpa=5.0,
+                    quota_kg=180.0,
+                    depletion_mpa_per_kg=0.1,
+                    switch_mode="immediate",
+                ),
+                "bank": IntakeSourceLimits(
+                    source_id="bank",
+                    cutoff_mpa=4.0,
+                    quota_kg=120.0,
+                    depletion_mpa_per_kg=0.05,
+                    switch_mode="buffered",
+                ),
+            },
+        ),
     )
 
 
@@ -403,6 +514,20 @@ def config_to_mapping(cfg: StationConfig) -> dict:
             "queue": {
                 "max_waiting": cfg.queue.max_waiting,
                 "confirm_timeout_s": cfg.queue.confirm_timeout_s,
+            },
+            "intake": {
+                "allocation_policy": cfg.intake.allocation_policy,
+                "switch_steps": cfg.intake.switch_steps,
+                "idle_flow_kg_per_min": cfg.intake.idle_flow_kg_per_min,
+                "sources": {
+                    source_id: {
+                        "cutoff_mpa": limits.cutoff_mpa,
+                        "quota_kg": limits.quota_kg,
+                        "depletion_mpa_per_kg": limits.depletion_mpa_per_kg,
+                        "switch_mode": limits.switch_mode,
+                    }
+                    for source_id, limits in cfg.intake.sources.items()
+                },
             },
         },
     }
